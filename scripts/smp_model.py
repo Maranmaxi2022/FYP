@@ -1,39 +1,30 @@
 """
-smp_model.py — SMTPD baseline multi-modal sequence regressor (Fig. 5 in the paper)
+smp_model.py — SMTPD multi-modal sequence regressors
 
-Architecture (per sample)
--------------------------
-Inputs:
-  • Visual (cover image): ResNet-101 backbone → 2048-D → MLP → 128-D
-  • Textual (5 fields: user_id, category, title, keywords, description):
-      mBERT pooled outputs (each 768-D) → stack → 1×1 conv over fields → 768-D → MLP → 128-D
-  • Numerical (5 features + optional EP): MLP → 128-D
-  • Categorical (category + language-from-title):
-      category embedding (128) & language embedding (128) → MLPs → element-wise product → MLP → 128-D
+Encoders (shared by both heads)
+-------------------------------
+• Visual (cover image): ResNet-101 backbone → 2048-D → MLP → 128-D
+• Textual (5 fields: user_id, category, title, keywords, description):
+    mBERT pooled outputs (each 768-D) → stack → 1×1 conv over fields → 768-D → MLP → 128-D
+• Numerical (5 features + optional EP=Day-1): MLP → 128-D
+• Categorical (category + language inferred from title):
+    category embedding (128) & language embedding (128) → MLPs → (⊙) → MLP → 128-D
+Fusion: concat [visual, categorical, textual, numeric] → 512-D
 
-Fusion:
-  Concatenate [visual(128), categorical(128), textual(128), numeric(128)] → 512-D
+Temporal heads
+--------------
+1) youtube_lstm3  — baseline unrolled LSTMCell with per-day heads (existing).
+2) youtube_tst3   — Time-series Transformer (TST): fused vector → linear to d_model,
+   tile to T tokens → add positional encodings → TransformerEncoder → per-day MLP head.
 
-Temporal regressor:
-  • Initial (h0, c0) from fused vector via MLP
-  • Unrolled LSTMCell for T=seq_length steps
-  • Per-step head: [h_t, c_t] → MLP → score_t (clamped ≥ 0)
-
-Notes
------
-- mBERT and ResNet feature extraction are done under `torch.no_grad()` to save memory.
-- Category strings in real CSVs can have minor spacing/punctuation differences; we normalize keys for lookup.
-- Language is inferred from the *title* using `langid` (kept as in your original code).
-
-Exports
--------
-- youtube_lstm3: nn.Module producing a [B, T] tensor of popularity scores.
+Both heads output a [B, T] tensor of non-negative popularity scores.
 """
 
 from __future__ import annotations
 
 import os
 import re
+import math
 from typing import List, Sequence, Tuple
 
 import torch
@@ -96,11 +87,7 @@ def _bert_features(
     Args
     ----
     texts : Sequence of 5 sequences, each length B (strings).
-            This is how PyTorch's default_collate transposes batches of lists.
-    tok   : mBERT tokenizer
-    mdl   : mBERT model
-    max_len : max tokens per field
-
+            (PyTorch default_collate transposes lists this way.)
     Returns
     -------
     Tensor with shape [B, 5, 768, 1] for downstream 1×1 conv.
@@ -117,18 +104,12 @@ def _bert_features(
 
 
 # -------------------------------------------------------------------
-# Model
+# LSTM temporal head (unchanged)
 # -------------------------------------------------------------------
 class youtube_lstm3(nn.Module):
     """
-    SMTPD baseline multi-modal sequence regressor (see module docstring).
-
-    Parameters
-    ----------
-    seq_length : int
-        Number of time steps (days) to predict.
-    batch_size : int
-        Kept for API compatibility; not directly used in forward.
+    SMTPD baseline multi-modal sequence regressor using an unrolled LSTM.
+    Produces non-negative scores of shape [B, T].
     """
     def __init__(self, seq_length: int, batch_size: int) -> None:
         super().__init__()
@@ -154,33 +135,18 @@ class youtube_lstm3(nn.Module):
         )
 
         # ---------------- Categorical ----------------
-        # Normalize keys to be robust to spacing/punctuation variants
         def _norm_key(s: str) -> str:
             return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
 
-        # Canonical YouTube categories used in the dataset (normalized)
         self._cate_vocab_norm = {
-            _norm_key("People & Blogs"):          1,
-            _norm_key("Gaming"):                  2,
-            _norm_key("News & Politics"):         3,
-            _norm_key("Entertainment"):           4,
-            _norm_key("Music"):                   5,
-            _norm_key("Education"):               6,
-            _norm_key("Sports"):                  7,
-            _norm_key("Howto & Style"):           8,
-            _norm_key("Film & Animation"):        9,
-            _norm_key("Nonprofits & Activism"):   10,
-            _norm_key("Travel"):                  11,
-            _norm_key("Comedy"):                  12,
-            _norm_key("Science & Technology"):    13,
-            _norm_key("Autos & Vehicles"):        14,
-            _norm_key("Pets & Animals"):          15,
+            _norm_key("People & Blogs"):1, _norm_key("Gaming"):2, _norm_key("News & Politics"):3,
+            _norm_key("Entertainment"):4, _norm_key("Music"):5, _norm_key("Education"):6,
+            _norm_key("Sports"):7, _norm_key("Howto & Style"):8, _norm_key("Film & Animation"):9,
+            _norm_key("Nonprofits & Activism"):10, _norm_key("Travel"):11, _norm_key("Comedy"):12,
+            _norm_key("Science & Technology"):13, _norm_key("Autos & Vehicles"):14, _norm_key("Pets & Animals"):15,
         }
-        # Backward-compatible fallback (index 0)
         self.cate_ooa_idx = 0
-
-        # A small language vocab (extend as needed)
-        self.lang_vocab = {"en": 1, "zh": 2, "ko": 3, "ja": 4, "hi": 5, "ru": 6, "OOA": 0}
+        self.lang_vocab = {"en":1, "zh":2, "ko":3, "ja":4, "hi":5, "ru":6, "OOA":0}
 
         self.cate_embed = nn.Embedding(16, 128)  # 0..15
         self.lang_embed = nn.Embedding(7, 128)   # 0..6
@@ -193,7 +159,6 @@ class youtube_lstm3(nn.Module):
             nn.Linear(128, 256), nn.BatchNorm1d(256, affine=False), nn.ReLU(),
             nn.Linear(256, 128),
         )
-        # After element-wise product (⊙) per Eq. (9) in the paper
         self.emb_mlp = nn.Sequential(
             nn.Linear(128, 256), nn.BatchNorm1d(256, affine=False), nn.ReLU(),
             nn.Linear(256, 128),
@@ -209,13 +174,11 @@ class youtube_lstm3(nn.Module):
         fused_len = 4 * 128
         self.vec_len = 128
 
-        # Initial (h0, c0) encoders from fused vector
         self.hc_mlp = nn.Sequential(
             nn.Linear(fused_len, 512), nn.BatchNorm1d(512, affine=False), nn.ReLU(),
             nn.Linear(512, self.vec_len),
         )
 
-        # Per-step temporal encoders (x_t) from the same fused vector
         self.x_mlps = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(fused_len, 768), nn.BatchNorm1d(768, affine=False), nn.ReLU(),
@@ -224,7 +187,6 @@ class youtube_lstm3(nn.Module):
             for _ in range(self.seq_length)
         ])
 
-        # Unrolled LSTM cells and per-step heads
         self.cells = nn.ModuleList([nn.LSTMCell(self.vec_len, self.vec_len) for _ in range(self.seq_length)])
         self.heads = nn.ModuleList([
             nn.Sequential(
@@ -235,86 +197,175 @@ class youtube_lstm3(nn.Module):
             for _ in range(self.seq_length)
         ])
 
-    # ---------------- Categorical helpers ----------------
     @staticmethod
     def _norm_key(s: str) -> str:
-        """Normalize category string for stable lookup."""
         return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
 
     def _embed_cat(self, categories: Sequence[str], titles: Sequence[str]) -> Tensor:
-        """
-        Embed category and inferred language, then combine via element-wise product (Eq. 9).
-        Returns a [B, 128] feature.
+        cate_ids = [self._cate_vocab_norm.get(self._norm_key(c), self.cate_ooa_idx) for c in categories]
+        langs = [langid.classify(t)[0] if t else "OOA" for t in titles]
+        langs = [ {"en":1,"zh":2,"ko":3,"ja":4,"hi":5,"ru":6}.get(l,0) for l in langs ]
 
-        categories: list[str] length B
-        titles:     list[str] length B (for language ID)
-        """
-        # Map categories via normalized keys
-        cate_ids = []
-        for c in categories:
-            idx = self._cate_vocab_norm.get(self._norm_key(c), self.cate_ooa_idx)
-            cate_ids.append(idx)
+        cate = self.cate_embed(torch.tensor(cate_ids, device=device))
+        lang = self.lang_embed(torch.tensor(langs, device=device))
+        cate = self.cate_mlp(cate)
+        lang = self.lang_mlp(lang)
+        return self.emb_mlp(cate * lang)
 
-        # Infer language for each title
-        langs = []
-        for t in titles:
-            code = langid.classify(t)[0] if t else "OOA"
-            langs.append(self.lang_vocab.get(code, 0))
-
-        cate = self.cate_embed(torch.tensor(cate_ids, device=device))  # [B, 128]
-        lang = self.lang_embed(torch.tensor(langs, device=device))     # [B, 128]
-        cate = self.cate_mlp(cate)                                     # [B, 128]
-        lang = self.lang_mlp(lang)                                     # [B, 128]
-
-        feat = self.emb_mlp(cate * lang)                               # [B, 128]
-        return feat
-
-    # ---------------- Forward ----------------
-    def forward(
-        self,
-        img: Tensor,                         # [B, 3, 224, 224]
-        texts: Sequence[Sequence[str]],      # 5 lists, each length B (collate-transposed)
-        meta: Tensor,                        # [B, 6]
-        cat: Sequence[Sequence[str]],        # [categories(list[B]), titles(list[B])]
-    ) -> Tuple[Tensor, None]:
-        """
-        Returns
-        -------
-        out : [B, T] popularity scores (clamped ≥ 0)
-        aux : None (placeholder for API parity)
-        """
+    def forward(self, img: Tensor, texts: Sequence[Sequence[str]], meta: Tensor,
+                cat: Sequence[Sequence[str]]) -> Tuple[Tensor, None]:
         B = img.size(0)
 
-        # ---- Visual ----
         with torch.no_grad():
-            vis = self.img_feature(img).view(B, -1)  # [B, 2048]
-        vis = self.img_mlp(vis)                      # [B, 128]
+            vis = self.img_feature(img).view(B, -1)
+        vis = self.img_mlp(vis)
 
-        # ---- Text ----
-        stacked = _bert_features(texts, self.tok, self.bert)  # [B, 5, 768, 1]
-        txt = self.text_conv(stacked)                         # [B, 768]
-        txt = self.text_mlp(txt)                              # [B, 128]
+        stacked = _bert_features(texts, self.tok, self.bert)
+        txt = self.text_conv(stacked)
+        txt = self.text_mlp(txt)
 
-        # ---- Numerical ----
-        met = self.meta_mlp(meta)                             # [B, 128]
+        met = self.meta_mlp(meta)
 
-        # ---- Categorical (category + language-from-title) ----
         categories, titles = cat[0], cat[1]
-        emb = self._embed_cat(categories, titles)             # [B, 128]
+        emb = self._embed_cat(categories, titles)
 
-        # ---- Fuse ----
+        fused = torch.cat([vis, emb, txt, met], dim=1)  # [B, 512]
+
+        h = self.hc_mlp(fused)
+        c = self.hc_mlp(fused)
+        out = torch.empty(B, self.seq_length, device=device)
+        for i in range(self.seq_length):
+            x = self.x_mlps[i](fused)
+            h, c = self.cells[i](x, (h, c))
+            s = torch.cat([h, c], dim=1)
+            y = self.heads[i](s).squeeze(1)
+            out[:, i] = y.clamp_min(0.0)
+        return out, None
+
+
+# -------------------------------------------------------------------
+# TST temporal head (NEW)
+# -------------------------------------------------------------------
+class PositionalEncoding(nn.Module):
+    """Standard sinusoidal positional encodings."""
+    def __init__(self, d_model: int, max_len: int = 512):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("pe", pe.unsqueeze(0))  # [1, L, D]
+
+    def forward(self, x: Tensor) -> Tensor:  # x: [B, L, D]
+        return x + self.pe[:, : x.size(1)]
+
+
+class youtube_tst3(nn.Module):
+    """
+    Transformer-based temporal head (“Time-series Transformer”, TST).
+
+    Pipeline:
+      fused(512) → Linear(d_model) → tile to T tokens → +PosEnc → TransformerEncoder →
+      per-token MLP → [B, T] (non-negative scores).
+    """
+    def __init__(self, seq_length: int, batch_size: int,
+                 d_model: int = 256, nhead: int = 8, num_layers: int = 4,
+                 dim_ff: int = 512, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.seq_length = seq_length
+        self.text_num = 5
+        self.meta_num = 6
+
+        # --- Shared encoders (same as LSTM head) ---
+        backbone = models.resnet101(weights=models.ResNet101_Weights.DEFAULT)
+        self.img_feature = nn.Sequential(*list(backbone.children())[:-1])
+        self.img_mlp = nn.Sequential(
+            nn.Linear(2048, 1024), nn.BatchNorm1d(1024, affine=False), nn.ReLU(),
+            nn.Linear(1024, 512),  nn.BatchNorm1d(512,  affine=False), nn.ReLU(),
+            nn.Linear(512, 128),
+        )
+
+        self.tok, self.bert = _bert()
+        self.text_conv = _TextConv(text_num=self.text_num)
+        self.text_mlp = nn.Sequential(
+            nn.Linear(768, 512), nn.BatchNorm1d(512, affine=False), nn.ReLU(),
+            nn.Linear(512, 128),
+        )
+
+        def _norm_key(s: str) -> str:
+            return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
+        self._cate_vocab_norm = {
+            _norm_key("People & Blogs"):1, _norm_key("Gaming"):2, _norm_key("News & Politics"):3,
+            _norm_key("Entertainment"):4, _norm_key("Music"):5, _norm_key("Education"):6,
+            _norm_key("Sports"):7, _norm_key("Howto & Style"):8, _norm_key("Film & Animation"):9,
+            _norm_key("Nonprofits & Activism"):10, _norm_key("Travel"):11, _norm_key("Comedy"):12,
+            _norm_key("Science & Technology"):13, _norm_key("Autos & Vehicles"):14, _norm_key("Pets & Animals"):15,
+        }
+        self.cate_ooa_idx = 0
+        self.lang_vocab = {"en":1, "zh":2, "ko":3, "ja":4, "hi":5, "ru":6, "OOA":0}
+        self.cate_embed = nn.Embedding(16, 128)
+        self.lang_embed = nn.Embedding(7, 128)
+        self.cate_mlp = nn.Sequential(nn.Linear(128,256), nn.BatchNorm1d(256, affine=False), nn.ReLU(), nn.Linear(256,128))
+        self.lang_mlp = nn.Sequential(nn.Linear(128,256), nn.BatchNorm1d(256, affine=False), nn.ReLU(), nn.Linear(256,128))
+        self.emb_mlp  = nn.Sequential(nn.Linear(128,256), nn.BatchNorm1d(256, affine=False), nn.ReLU(), nn.Linear(256,128))
+
+        self.meta_mlp = nn.Sequential(
+            nn.Linear(self.meta_num, 128), nn.BatchNorm1d(128, affine=False), nn.ReLU(),
+            nn.Linear(128, 128),
+        )
+
+        # --- Fusion → Transformer ---
+        fused_len = 4 * 128  # 512
+        self.fuse2model = nn.Linear(fused_len, d_model)
+        self.pos = PositionalEncoding(d_model, max_len=seq_length)
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=dim_ff,
+            dropout=dropout, batch_first=True
+        )
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+        self.head = nn.Sequential(
+            nn.Linear(d_model, d_model // 2), nn.ReLU(),
+            nn.Linear(d_model // 2, 1),
+        )
+
+    @staticmethod
+    def _norm_key(s: str) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
+
+    def _embed_cat(self, categories: Sequence[str], titles: Sequence[str]) -> Tensor:
+        cate_ids = [self._cate_vocab_norm.get(self._norm_key(c), self.cate_ooa_idx) for c in categories]
+        langs = [langid.classify(t)[0] if t else "OOA" for t in titles]
+        langs = [ {"en":1,"zh":2,"ko":3,"ja":4,"hi":5,"ru":6}.get(l,0) for l in langs ]
+        cate = self.cate_embed(torch.tensor(cate_ids, device=device))
+        lang = self.lang_embed(torch.tensor(langs, device=device))
+        cate = self.cate_mlp(cate); lang = self.lang_mlp(lang)
+        return self.emb_mlp(cate * lang)
+
+    def forward(self, img: Tensor, texts: Sequence[Sequence[str]], meta: Tensor,
+                cat: Sequence[Sequence[str]]) -> Tuple[Tensor, None]:
+        B = img.size(0)
+
+        # Encoders (frozen convnet for memory; BERT pooled features)
+        with torch.no_grad():
+            vis = self.img_feature(img).view(B, -1)
+        vis = self.img_mlp(vis)
+
+        stacked = _bert_features(texts, self.tok, self.bert)
+        txt = self.text_conv(stacked)
+        txt = self.text_mlp(txt)
+
+        met = self.meta_mlp(meta)
+
+        categories, titles = cat[0], cat[1]
+        emb = self._embed_cat(categories, titles)
+
         fused = torch.cat([vis, emb, txt, met], dim=1)        # [B, 512]
 
-        # ---- LSTM unroll with per-step heads ----
-        h = self.hc_mlp(fused)                                # [B, 128]
-        c = self.hc_mlp(fused)                                # [B, 128]
-        out = torch.empty(B, self.seq_length, device=device)
-
-        for i in range(self.seq_length):
-            x = self.x_mlps[i](fused)                         # [B, 128]
-            h, c = self.cells[i](x, (h, c))
-            s = torch.cat([h, c], dim=1)                      # [B, 256]
-            y = self.heads[i](s).squeeze(1)                   # [B]
-            out[:, i] = y.clamp_min(0.0)                      # scores are non-negative
-
-        return out, None
+        # Transformer over time: tile fused vector to T tokens, add PE, encode, project
+        z = self.fuse2model(fused).unsqueeze(1)               # [B, 1, D]
+        z = z.repeat(1, self.seq_length, 1)                   # [B, T, D]
+        z = self.pos(z)
+        z = self.encoder(z)                                   # [B, T, D]
+        y = self.head(z).squeeze(-1)                          # [B, T]
+        return y.clamp_min(0.0), None
