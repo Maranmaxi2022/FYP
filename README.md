@@ -1,11 +1,9 @@
-This repo contains our research code and instructions to reproduce the **SMTPD** baseline results reported in the paper (https://arxiv.org/abs/2503.04446).
+This repository provides a strong multi-modal baseline built with a **Time-Series Transformer (TST)** as the temporal head (replacing the LSTM used in the [paper’s](https://arxiv.org/abs/2503.04446) original baseline).
+The model fuses **visual** (thumbnail), **textual** (mBERT), **categorical** (category + language), and **numerical** features (plus optional **Early Popularity, EP**), and predicts a sequence of daily popularity scores.
 
-## Environment
-
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-```
+<p align="center">
+  <img src="src/FYP.png" width="820" alt="Model overview">
+</p>
 
 ## Data format
 
@@ -13,99 +11,94 @@ pip install -r requirements.txt
 
 **Columns (0‑indexed):**
 
-* `0`  — `video_id`
-* `5`  — `user_id`
-* `6`  — `category` (one of 15 YouTube categories in English)
-* `7`  — `title`
-* `8`  — `keywords/hashtags`
-* `9`  — `description`
-* `10..14` — five numeric features (floats; e.g., duration, followers, posts, title\_len, tag\_count)
-* `15..` — **popularity score sequence (Day‑1..Day‑30)**
+* `0`  - `video_id`
+* `5`  - `user_id`
+* `6`  - `category` (one of 15 YouTube categories in English)
+* `7`  - `title`
+* `8`  - `keywords/hashtags`
+* `9`  - `description`
+* `10..14` - five numeric features (floats; e.g., duration, followers, posts, title\_len, tag\_count)
+* `15..` - **popularity score sequence (Day‑1..Day‑30)**
 
-## Model summary
+## Setup
 
-Implemented in `smp_model.py`:
-
-* **Visual**: ResNet‑101 backbone → 2048 → MLP → **128‑D**
-* **Text** (5 fields via mBERT): pooled outputs → stack → **1×1 conv** across fields → MLP → **128‑D**
-* **Numerical**: 5 stats + **EP** → MLP → **128‑D**
-* **Categorical**: category embedding + language‑from‑title (langid) → MLPs → element‑wise product → **128‑D**
-* **Fusion**: concat 4×128 → **512‑D** → LSTMCell unrolled for T steps → per‑step regression heads
-* **Loss**: Composite Gradient Loss (SmoothL1 + Δ/Δ² + peak alignment + tiny Laplacian; cosine‑annealed weights)
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+```
 
 ## Training
 
-We train **two models** (same architecture, different config).
-
-### 1) **No‑EP model** (predicts Days **1–30**)
+### 1) TST **without** EP → predicts **Days 1–30** (30 steps)
 
 ```bash
-DATA=/path/to/basic_view_pn.csv
-IMG=/path/to/img_yt
-CK=./ckpts_no_ep
-
-python main.py --train --K_fold 0 --seq_len 30 \
-  --data_files "$DATA" --images_dir "$IMG" --ckpt_path "$CK"
+python scripts/main.py --train --temporal tst \
+  --K_fold 0 --seq_len 30 \
+  --data_files data/basic_view_pn.csv \
+  --images_dir data/img_yt \
+  --ckpt_path ckpts/tst_wo_ep
 ```
 
-### 2) **With‑EP model** (EP=Day‑1 input; predicts Days **2–30**, 29 steps)
+### 2) TST **with** EP → predicts **Days 2–30** (29 steps)
 
 ```bash
-CK=./ckpts_with_ep
-
-python main.py --train --K_fold 0 --seq_len 29 --use_ep \
-  --data_files "$DATA" --images_dir "$IMG" --ckpt_path "$CK"
+python scripts/main.py --train --temporal tst \
+  --K_fold 0 --use_ep --seq_len 29 \
+  --data_files data/basic_view_pn.csv \
+  --images_dir data/img_yt \
+  --ckpt_path ckpts/tst_w_ep
 ```
 
-**Defaults:** `--epochs 20`, `--batch_size 64`. Use `--seed` for reproducibility and `--no_ckpt` to skip saving.
-
-## Selecting the best epoch
-
-Each training saves `<K>-epoch<N>.pth`. Use `--eval_all` to score every epoch and print a leaderboard by **AMAE** on a chosen window.
-
-**No‑EP (1–30 window):**
+## Evaluation
 
 ```bash
-python main.py --eval_all --K_fold 0 --seq_len 30 \
-  --eval_from 1 --eval_to 30 \
-  --data_files "$DATA" --images_dir "$IMG" --ckpt_path "$CK"
+# Example: TST without EP, window 1..30
+python scripts/main.py --eval_all --temporal tst \
+  --K_fold 0 --seq_len 30 \
+  --data_files data/basic_view_pn.csv --images_dir data/img_yt \
+  --ckpt_path ckpts/tst_wo_ep \
+  --eval_from 1 --eval_to 30
 ```
-
-**With‑EP (2–30 window = steps 1..29):**
 
 ```bash
-python main.py --eval_all --K_fold 0 --seq_len 29 --use_ep \
-  --eval_from 1 --eval_to 29 \
-  --data_files "$DATA" --images_dir "$IMG" --ckpt_path "$CK"
+# Example: TST with EP, window 1..29 (corresponds to calendar Days 2..30)
+python scripts/main.py --eval_all --temporal tst \
+  --K_fold 0 --use_ep --seq_len 29 \
+  --data_files data/basic_view_pn.csv --images_dir data/img_yt \
+  --ckpt_path ckpts/tst_w_ep \
+  --eval_from 1 --eval_to 29
 ```
 
-Note the top checkpoint name (e.g., `0-epoch12.pth`).
+## Results
 
-## EP setups
+### Table I — Component study (✓ marks enabled modules)
 
-1. **w/o. EP (1–30)** — No‑EP model, window **1..30**
+| BERT-Base | BERT-Mul | MLP | LSTM | **TST** |  **AMAE** |  **ASRC** |
+| :-------: | :------: | :-: | :--: | :-----: | --------: | --------: |
+|     ✓     |          |     |   ✓  |         |     0.782 |     0.958 |
+|           |     ✓    |  ✓  |      |         |     0.786 |     0.958 |
+|           |     ✓    |     |   ✓  |         |     0.746 |     0.958 |
+|           |     ✓    |     |      |  **✓**  | **0.723** | **0.960** |
 
-```bash
-python main.py --test --K_fold 0 --seq_len 30 \
-  --ckpt_path ./ckpts_no_ep --ckpt_name <BEST_NOEP>.pth \
-  --eval_from 1 --eval_to 30 \
-  --data_files "$DATA" --images_dir "$IMG"
-```
+### Table II — SMTPD Day-7 / Day-14 / Day-30 (MAE/SRC averages)
 
-2. **w/o. EP (2–30)** — same No‑EP checkpoint, window **2..30**
+| Method                                                        |  SMTPD (day 7)  |  SMTPD (day 14) |  SMTPD (day 30) |
+|:--------------------------------------------------------------| :-------------: | :-------------: | :-------------: |
+| [Ding et al.](https://dl.acm.org/doi/10.1145/3343031.3356062) |   1.715/0.849   |   1.669/0.846   |   1.592/0.843   |
+|  w. EP                                                        |   0.715/0.964   |   0.742/0.959   |   0.749/0.931   |
+| [Lai et al.](https://dl.acm.org/doi/10.1145/3394171.3416273)  |   1.573/0.875   |   1.524/0.872   |   1.495/0.864   |
+|  w. EP                                                        |   0.725/0.957   |   0.753/0.962   |   0.760/0.957   |
+| [Xu et al.](https://dl.acm.org/doi/10.1145/3394171.3416274)   |   1.895/0.817   |   1.832/0.818   |   1.743/0.820   |
+|  w. EP                                                        |   0.754/0.962   |   0.798/0.956   |   0.822/0.949   |
+| [SMTPD (Xu et al.)](https://arxiv.org/abs/2503.04446)         |   1.673/0.852   |   1.628/0.850   |   1.563/0.848   |
+|  w. EP                                                        |   0.732/0.963   |   0.766/0.957   |   0.775/0.952   |
+| **Ours w/o. EP**                                              | **1.651/0.856** | **1.605/0.854** | **1.542/0.851** |
+| **Ours**                                                      | **0.710/0.964** | **0.737/0.959** | **0.745/0.954** |
 
-```bash
-python main.py --test --K_fold 0 --seq_len 30 \
-  --ckpt_path ./ckpts_no_ep --ckpt_name <BEST_NOEP>.pth \
-  --eval_from 2 --eval_to 30 \
-  --data_files "$DATA" --images_dir "$IMG"
-```
+### Table III — EP assessment across scenarios
 
-3. **Ours (with EP)** — With‑EP model, window **1..29** (true Days 2–30)
-
-```bash
-python main.py --test --K_fold 0 --seq_len 29 --use_ep \
-  --ckpt_path ./ckpts_with_ep --ckpt_name <BEST_EP>.pth \
-  --eval_from 1 --eval_to 29 \
-  --data_files "$DATA" --images_dir "$IMG"
-```
+| Method           |  **AMAE** |  **ASRC** | **MAE** (day 30 only) | **SRC** (day 30 only) |
+| :--------------- | --------: | --------: |----------------------:|----------------------:|
+| w/o. EP (1–30)   |     1.540 |     0.866 |                 1.530 |                 0.850 |
+| w/o. EP (2–30)   |     1.610 |     0.852 |                 1.551 |                 0.849 |
+| **Ours (w. EP)** | **0.723** | **0.960** |                 0.741 |                 0.954 |
