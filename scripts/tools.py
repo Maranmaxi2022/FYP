@@ -1,5 +1,5 @@
 """
-tools.py — metric helpers for SMTPD sequence regression
+tools.py — metric helpers
 
 Provided metrics
 ----------------

@@ -1,5 +1,5 @@
 """
-smp_data.py — Dataset for SMTPD multi-modal time-series prediction
+smp_data.py — Dataset
 
 This dataset reads a single CSV (e.g., `basic_view_pn.csv`) and returns, per sample:
   - "img": 224×224 RGB tensor (cover thumbnail <video_id>.jpg, zeros if missing)
