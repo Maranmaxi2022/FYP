@@ -3,7 +3,7 @@ This repo contains our research code and instructions to reproduce the **SMTPD**
 ## Environment
 
 ```bash
-python -m venv .venv && source .venv/bin/activate   # or use conda
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
@@ -20,7 +20,7 @@ pip install -r requirements.txt
 * `8`  — `keywords/hashtags`
 * `9`  — `description`
 * `10..14` — five numeric features (floats; e.g., duration, followers, posts, title\_len, tag\_count)
-* `15..` — **popularity score sequence (Day‑1..Day‑30)** in the paper’s log unit `p = log2(v/d + 1)`
+* `15..` — **popularity score sequence (Day‑1..Day‑30)**
 
 ## Model summary
 
@@ -28,7 +28,7 @@ Implemented in `smp_model.py`:
 
 * **Visual**: ResNet‑101 backbone → 2048 → MLP → **128‑D**
 * **Text** (5 fields via mBERT): pooled outputs → stack → **1×1 conv** across fields → MLP → **128‑D**
-* **Numerical**: 5 stats + **EP (optional Day‑1)** → MLP → **128‑D**
+* **Numerical**: 5 stats + **EP** → MLP → **128‑D**
 * **Categorical**: category embedding + language‑from‑title (langid) → MLPs → element‑wise product → **128‑D**
 * **Fusion**: concat 4×128 → **512‑D** → LSTMCell unrolled for T steps → per‑step regression heads
 * **Loss**: Composite Gradient Loss (SmoothL1 + Δ/Δ² + peak alignment + tiny Laplacian; cosine‑annealed weights)
@@ -48,7 +48,7 @@ python main.py --train --K_fold 0 --seq_len 30 \
   --data_files "$DATA" --images_dir "$IMG" --ckpt_path "$CK"
 ```
 
-### 2) **With‑EP model (“Ours”)** (EP=Day‑1 input; predicts Days **2–30**, 29 steps)
+### 2) **With‑EP model** (EP=Day‑1 input; predicts Days **2–30**, 29 steps)
 
 ```bash
 CK=./ckpts_with_ep
