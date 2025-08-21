@@ -13,7 +13,7 @@ The model fuses **visual** (thumbnail), **textual** (mBERT), **categorical** (ca
 
 * `0`  - `video_id`
 * `5`  - `user_id`
-* `6`  - `category` (one of 15 YouTube categories in English)
+* `6`  - `category`
 * `7`  - `title`
 * `8`  - `keywords/hashtags`
 * `9`  - `description`
